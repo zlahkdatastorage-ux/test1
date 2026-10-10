@@ -2,6 +2,7 @@
 #include "CMenu.h"
 #include "CSound.h"
 #include "Sounds.h"
+#include <new>
 
 //-----------------------------------------------------------------------------
 // Name: PostReset()
@@ -10,13 +11,26 @@
 
 void cMenu::PostReset(LPDIRECT3DDEVICE9 pDevice)
 {
-	if(font == NULL)
+	if (!pDevice || font != NULL)
+		return;
+
+	CD3DFont* candidate = new (std::nothrow) CD3DFont((char*)"Tahoma", 7, D3DFONT_BOLD);
+	if (!candidate)
 	{
-	font = new CD3DFont((char *)"Tahoma", 7, D3DFONT_BOLD);
-	font->InitDeviceObjects(pDevice);
-	font->RestoreDeviceObjects();
-	this->FontCreated = true;
+		FontCreated = false;
+		return;
 	}
+
+	// Do not publish a partially initialized font. Keep reset/retry safe.
+	if (FAILED(candidate->InitDeviceObjects(pDevice)) ||
+		FAILED(candidate->RestoreDeviceObjects()))
+	{
+		delete candidate;
+		FontCreated = false;
+		return;
+	}
+	font = candidate;
+	FontCreated = true;
 }
 
 //-----------------------------------------------------------------------------
@@ -29,8 +43,8 @@ void cMenu::PreReset(void)
 	if (!font) // may be called from Reset_hook() before PostReset ever created it
 		return;
 
-	font->InvalidateDeviceObjects();
-	font->DeleteDeviceObjects();
+	// CD3DFont's destructor releases its device-dependent objects.
+	delete font;
 	font = NULL;
 	this->FontCreated = false;
 }
@@ -67,20 +81,18 @@ void cMenu::Init()
 char* cMenu::FPS(int en)
 {
 	static int	 FPScounter = 0;
-	static float FPSfLastTickCount = 0.0f;
-	static float FPSfCurrentTickCount;
-	static char  cfps[6] = "";
-
-	if(!en)
+	static ULONGLONG lastTick = 0;
+	static char cfps[32] = "";
+	if (!en)
 	{
-		FPSfCurrentTickCount = clock() * 0.001f;
+		const ULONGLONG now = GetTickCount64();
 		FPScounter++;
-
-		if((FPSfCurrentTickCount - FPSfLastTickCount) > 1.0f)
+		if (lastTick == 0) lastTick = now;
+		if (now - lastTick >= 1000)
 		{
-			FPSfLastTickCount = FPSfCurrentTickCount;
-			sprintf(cfps,"%d FPS",FPScounter);
+			sprintf_s(cfps, sizeof(cfps), "%d FPS", FPScounter);
 			FPScounter = 0;
+			lastTick = now;
 		}
 	}
 	return cfps;
@@ -93,15 +105,19 @@ char* cMenu::FPS(int en)
 
 char* cMenu::TIME(void)
 {
-	static char ctime[20] = "" ;
-	struct tm * current_tm;
-	time_t current_time;
-	time (&current_time);
-	current_tm = localtime (&current_time);
-	if(current_tm->tm_hour>12)
-		sprintf( ctime, "%d:%02d:%02d PM", current_tm->tm_hour - 12, current_tm->tm_min, current_tm->tm_sec );
-	else
-		sprintf( ctime, "%d:%02d:%02d AM", current_tm->tm_hour, current_tm->tm_min, current_tm->tm_sec );
+	static char ctime[20] = "";
+	time_t current_time = time(NULL);
+	struct tm current_tm = {};
+	if (current_time == (time_t)-1 || localtime_s(&current_tm, &current_time) != 0)
+	{
+		strcpy_s(ctime, sizeof(ctime), "--:--:--");
+		return ctime;
+	}
+
+	int hour = current_tm.tm_hour % 12;
+	if (hour == 0) hour = 12;
+	sprintf_s(ctime, sizeof(ctime), "%d:%02d:%02d %s", hour,
+		current_tm.tm_min, current_tm.tm_sec, current_tm.tm_hour >= 12 ? "PM" : "AM");
 	return ctime;
 }
 
@@ -112,13 +128,22 @@ char* cMenu::TIME(void)
 
 char* cMenu::DATE(void)
 {
-	struct tm * current_tm;
-	time_t current_time;time (&current_time);
-	current_tm = localtime (&current_time);
-	char *month	[]={ (char *)"Jan.",(char *)"Feb.",(char *)"Mar.",(char *)"Apr.",(char *)"May",(char *)"June",(char *)"July",(char *)"Aug.",(char *)"Sept.",(char *)"Oct.",(char *)"Nov.",(char *)"Dec."};
-	static char logbuf[ 256 ];   // was `new char[256]` per call: leaked 256 B every frame the menu was open
+	static const char* const months[] = {
+		"Jan.", "Feb.", "Mar.", "Apr.", "May", "June",
+		"July", "Aug.", "Sept.", "Oct.", "Nov.", "Dec."
+	};
+	static char logbuf[32];
+	time_t current_time = time(NULL);
+	struct tm current_tm = {};
+	if (current_time == (time_t)-1 || localtime_s(&current_tm, &current_time) != 0 ||
+		current_tm.tm_mon < 0 || current_tm.tm_mon >= 12)
+	{
+		strcpy_s(logbuf, sizeof(logbuf), "---- --, ----");
+		return logbuf;
+	}
 
-	sprintf( logbuf, "%s %02d, 20%d",month[current_tm->tm_mon],current_tm->tm_mday,current_tm->tm_year-100);
+	sprintf_s(logbuf, sizeof(logbuf), "%s %02d, %04d", months[current_tm.tm_mon],
+		current_tm.tm_mday, current_tm.tm_year + 1900);
 	return logbuf;
 }
 
@@ -132,8 +157,9 @@ char* cMenu::oprintf (const char *fmt, ...)
 	static char buffer[225] = "";
 	va_list va_alist;
 	va_start (va_alist, fmt);
-	_vsnprintf (buffer,sizeof(buffer), fmt, va_alist);
-	va_end (va_alist);
+	_vsnprintf(buffer, sizeof(buffer), fmt, va_alist);
+	va_end(va_alist);
+	buffer[sizeof(buffer) - 1] = '\0';
 	return buffer;
 }
 //-----------------------------------------------------------------------------
@@ -166,14 +192,14 @@ int cMenu::Load(char* szSection, char* szKey, int iDefaultValue,LPCSTR file)
 
 void cMenu::additem(char *title, char *states,int type, int *var, int show, int when)
 {
-	if(show==when)
+	if (show == when && NO >= 0 && NO < ITEM_ARRAY && title && states && var)
 	{
-		strcpy(items[NO].title,title);
-		getfield(states,items[NO].state,*var+1);
-		items[NO].type=type;
-		items[NO].max=nofields(states);
-		items[NO].val=var;
-
+		strncpy(items[NO].title, title, sizeof(items[NO].title) - 1);
+		items[NO].title[sizeof(items[NO].title) - 1] = '\0';
+		getfield(states, items[NO].state, sizeof(items[NO].state), *var + 1);
+		items[NO].type = type;
+		items[NO].max = nofields(states);
+		items[NO].val = var;
 		NO++;
 	}
 	if(type!=T_TEXT)
@@ -227,39 +253,42 @@ void cMenu::atext(char *title, char *states)
 // Desc: Calculates Number of Fields in a String based on deliminator
 //-----------------------------------------------------------------------------
 
-int cMenu::nofields(char *str)
+int cMenu::nofields(const char *str)
 {
-	char *ptr;
-	int  no;
-	for(no=1; (ptr=strchr(str,(char)'|'))!=NULL; no++)str=ptr+1;
-	
-	return no;
+	if (!str || !*str) return 0;
+	int count = 1;
+	for (const char *p = str; *p; ++p)
+		if (*p == '|') ++count;
+	return count;
 }
 
 //-----------------------------------------------------------------------------
 // Name: getfield()
-// Desc: Grabs Field in string based on deliminator
+// Desc: Bounded field extraction for the fixed-size menu state buffer
 //-----------------------------------------------------------------------------
 
-void cMenu::getfield(char *str,char *dst,int no)
+void cMenu::getfield(const char *str, char *dst, size_t dstSize, int no)
 {
-	char *ptr;
-	int  i;
-	for(i=1; (ptr=strchr(str,(char)'|'))!=NULL ; i++) 
+	if (!dst || dstSize == 0) return;
+	dst[0] = '\0';
+	if (!str) return;
+	if (no < 1) no = 1;
+
+	const char *begin = str;
+	for (int field = 1; field < no && *begin; ++field)
 	{
-		if(i==no) break;
-		str=ptr+1;
+		const char *delimiter = strchr(begin, '|');
+		if (!delimiter) { begin += strlen(begin); break; }
+		begin = delimiter + 1;
 	}
-	if(ptr)
-	{
-		i=(int)(ptr-str);
-		strncpy(dst,str,i);
-		dst[i]=0;
-	}
-	else
-		strcpy(dst,str);
+	const char *end = strchr(begin, '|');
+	size_t length = end ? (size_t)(end - begin) : strlen(begin);
+	if (length >= dstSize) length = dstSize - 1;
+	memcpy(dst, begin, length);
+	dst[length] = '\0';
 }
 
+//-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 // Name: DrawBox()
 // Desc: Fills Rectangle using DrawPrimitive Up
@@ -267,6 +296,7 @@ void cMenu::getfield(char *str,char *dst,int no)
 
 void cMenu::DrawBox( int x, int y, int w, int h, D3DCOLOR Color,LPDIRECT3DDEVICE9 pDevice)
 {
+	if (!pDevice || w <= 0 || h <= 0) return;
 	struct Vertex 
 	{
 		float x,y,z,ht;
@@ -281,7 +311,7 @@ void cMenu::DrawBox( int x, int y, int w, int h, D3DCOLOR Color,LPDIRECT3DDEVICE
 	};
 	pDevice->SetTexture(0, NULL);
 	pDevice->SetPixelShader(NULL);
-	pDevice->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1); 
+	pDevice->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE); 
 	pDevice->SetRenderState(D3DRS_ALPHABLENDENABLE,true);
 	pDevice->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
 	pDevice->SetRenderState(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);
@@ -312,11 +342,13 @@ void cMenu::DrawGameTextPixelFlag(int x, int y, DWORD color, DWORD flags, char *
     if( !szFormat )return;
 
     char logbuf[256] = { 0 };
+    if (!font) return;
 
     va_list va_alist;
-    va_start (va_alist, szFormat);
+    va_start(va_alist, szFormat);
     _vsnprintf(logbuf, sizeof(logbuf), szFormat, va_alist);
-    va_end (va_alist);
+    va_end(va_alist);
+    logbuf[sizeof(logbuf) - 1] = '\0';
 
     if( flags == DT_RIGHT )
     {
@@ -349,6 +381,7 @@ void cMenu::DrawGameTextPixelFlag(int x, int y, DWORD color, DWORD flags, char *
 
 void cMenu::ShowMenu(LPDIRECT3DDEVICE9 pDevice)
 {
+	if (!pDevice) return;
 	//-----------------------------------------------------------------------------
 	// Desc: Check Hotkeys
 	// Level-based reads (0x8000 = current physical state) + our own
@@ -572,13 +605,13 @@ void cMenu::ShowMenu(LPDIRECT3DDEVICE9 pDevice)
 		if(mpos.x>X && mpos.x<MC_MAXX && mpos.y<MC_ITEMY(NO) && mpos.y>Y)
 			mno = ((mpos.y-T_SPC)>Y)?((mpos.y - Y - T_SPC - (T_SPC/2)) / I_SPC):(999);
 
-		if(mno!=999 && mno<NO && rm && (*items[mno].val)>0)
+		if (mno >= 0 && mno < NO && items[mno].val && rm && (*items[mno].val) > 0)
 		{
 			(*items[mno].val)-=1;
 			Sound.wav.playsoundmem((LPCSTR)SWITCH);
 		}
 
-		if(mno!=999 && mno<NO && lm)
+		if (mno >= 0 && mno < NO && items[mno].val && lm && items[mno].max > 0)
 		{
 			// Wrap to OFF instead of stopping at max-1. With the old bound a
 			// second left-click did nothing once a feature was ON, which is
@@ -597,31 +630,38 @@ void cMenu::ShowMenu(LPDIRECT3DDEVICE9 pDevice)
 			// cursor index can point past the new list (stale item state).
 			if(I_CUR >= NO) I_CUR = NO - 1;
 
-			if(left && (*items[I_CUR].val)>0)
+			if (items[I_CUR].val && left && (*items[I_CUR].val) > 0)
 			{
 				(*items[I_CUR].val)-=1;
 				Sound.wav.playsoundmem((LPCSTR)SWITCH);
 			}
 
-			if(right)
+			if (items[I_CUR].val && right && items[I_CUR].max > 0)
 			{
 				// Wrap to OFF - same rationale as the left-click path above.
 				(*items[I_CUR].val) = ((*items[I_CUR].val) + 1 >= items[I_CUR].max) ? 0 : (*items[I_CUR].val) + 1;
 				Sound.wav.playsoundmem((LPCSTR)SWITCH);
 			}
 
-			if(up){
-				do{
-					I_CUR=(I_CUR==0)?(NO-1):(I_CUR-1);
-				}while (items[I_CUR].type==T_TEXT);
-				Sound.wav.playsoundmem((LPCSTR)MOVE);
-			}
-
-			if(down || items[I_CUR].type==T_TEXT){
-				do{
-					I_CUR=(I_CUR+1)%NO;
-				}while (items[I_CUR].type==T_TEXT);
-				Sound.wav.playsoundmem((LPCSTR)MOVE);
+			if (up || down || items[I_CUR].type == T_TEXT)
+			{
+				// The list can contain only text rows when conditional items
+				// are hidden. Bound the search so navigation cannot spin forever.
+				bool foundSelectable = false;
+				for (int step = 0; step < NO; ++step)
+				{
+					if (up)
+						I_CUR = (I_CUR == 0) ? (NO - 1) : (I_CUR - 1);
+					else
+						I_CUR = (I_CUR + 1) % NO;
+					if (items[I_CUR].type != T_TEXT && items[I_CUR].val)
+					{
+						foundSelectable = true;
+						break;
+					}
+				}
+				if (foundSelectable)
+					Sound.wav.playsoundmem((LPCSTR)MOVE);
 			}
 		}
 
