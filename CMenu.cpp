@@ -10,13 +10,26 @@
 
 void cMenu::PostReset(LPDIRECT3DDEVICE9 pDevice)
 {
-	if(font == NULL)
+	if (!pDevice || font != NULL)
+		return;
+
+	CD3DFont* candidate = new (std::nothrow) CD3DFont((char*)"Tahoma", 7, D3DFONT_BOLD);
+	if (!candidate)
 	{
-	font = new CD3DFont((char *)"Tahoma", 7, D3DFONT_BOLD);
-	font->InitDeviceObjects(pDevice);
-	font->RestoreDeviceObjects();
-	this->FontCreated = true;
+		FontCreated = false;
+		return;
 	}
+
+	// Do not publish a partially initialized font. Keep reset/retry safe.
+	if (FAILED(candidate->InitDeviceObjects(pDevice)) ||
+		FAILED(candidate->RestoreDeviceObjects()))
+	{
+		delete candidate;
+		FontCreated = false;
+		return;
+	}
+	font = candidate;
+	FontCreated = true;
 }
 
 //-----------------------------------------------------------------------------
@@ -91,15 +104,19 @@ char* cMenu::FPS(int en)
 
 char* cMenu::TIME(void)
 {
-	static char ctime[20] = "" ;
-	struct tm * current_tm;
-	time_t current_time;
-	time (&current_time);
-	current_tm = localtime (&current_time);
-	if(current_tm->tm_hour>12)
-		sprintf( ctime, "%d:%02d:%02d PM", current_tm->tm_hour - 12, current_tm->tm_min, current_tm->tm_sec );
-	else
-		sprintf( ctime, "%d:%02d:%02d AM", current_tm->tm_hour, current_tm->tm_min, current_tm->tm_sec );
+	static char ctime[20] = "";
+	time_t current_time = time(NULL);
+	struct tm current_tm = {};
+	if (current_time == (time_t)-1 || localtime_s(&current_tm, &current_time) != 0)
+	{
+		strcpy_s(ctime, sizeof(ctime), "--:--:--");
+		return ctime;
+	}
+
+	int hour = current_tm.tm_hour % 12;
+	if (hour == 0) hour = 12;
+	sprintf_s(ctime, sizeof(ctime), "%d:%02d:%02d %s", hour,
+		current_tm.tm_min, current_tm.tm_sec, current_tm.tm_hour >= 12 ? "PM" : "AM");
 	return ctime;
 }
 
@@ -110,13 +127,22 @@ char* cMenu::TIME(void)
 
 char* cMenu::DATE(void)
 {
-	struct tm * current_tm;
-	time_t current_time;time (&current_time);
-	current_tm = localtime (&current_time);
-	char *month	[]={ (char *)"Jan.",(char *)"Feb.",(char *)"Mar.",(char *)"Apr.",(char *)"May",(char *)"June",(char *)"July",(char *)"Aug.",(char *)"Sept.",(char *)"Oct.",(char *)"Nov.",(char *)"Dec."};
-	static char logbuf[ 256 ];   // was `new char[256]` per call: leaked 256 B every frame the menu was open
+	static const char* const months[] = {
+		"Jan.", "Feb.", "Mar.", "Apr.", "May", "June",
+		"July", "Aug.", "Sept.", "Oct.", "Nov.", "Dec."
+	};
+	static char logbuf[32];
+	time_t current_time = time(NULL);
+	struct tm current_tm = {};
+	if (current_time == (time_t)-1 || localtime_s(&current_tm, &current_time) != 0 ||
+		current_tm.tm_mon < 0 || current_tm.tm_mon >= 12)
+	{
+		strcpy_s(logbuf, sizeof(logbuf), "---- --, ----");
+		return logbuf;
+	}
 
-	sprintf( logbuf, "%s %02d, 20%d",month[current_tm->tm_mon],current_tm->tm_mday,current_tm->tm_year-100);
+	sprintf_s(logbuf, sizeof(logbuf), "%s %02d, %04d", months[current_tm.tm_mon],
+		current_tm.tm_mday, current_tm.tm_year + 1900);
 	return logbuf;
 }
 
@@ -576,13 +602,13 @@ void cMenu::ShowMenu(LPDIRECT3DDEVICE9 pDevice)
 		if(mpos.x>X && mpos.x<MC_MAXX && mpos.y<MC_ITEMY(NO) && mpos.y>Y)
 			mno = ((mpos.y-T_SPC)>Y)?((mpos.y - Y - T_SPC - (T_SPC/2)) / I_SPC):(999);
 
-		if(mno!=999 && mno<NO && rm && (*items[mno].val)>0)
+		if (mno >= 0 && mno < NO && items[mno].val && rm && (*items[mno].val) > 0)
 		{
 			(*items[mno].val)-=1;
 			Sound.wav.playsoundmem((LPCSTR)SWITCH);
 		}
 
-		if(mno!=999 && mno<NO && lm)
+		if (mno >= 0 && mno < NO && items[mno].val && lm && items[mno].max > 0)
 		{
 			// Wrap to OFF instead of stopping at max-1. With the old bound a
 			// second left-click did nothing once a feature was ON, which is
@@ -601,13 +627,13 @@ void cMenu::ShowMenu(LPDIRECT3DDEVICE9 pDevice)
 			// cursor index can point past the new list (stale item state).
 			if(I_CUR >= NO) I_CUR = NO - 1;
 
-			if(left && (*items[I_CUR].val)>0)
+			if (items[I_CUR].val && left && (*items[I_CUR].val) > 0)
 			{
 				(*items[I_CUR].val)-=1;
 				Sound.wav.playsoundmem((LPCSTR)SWITCH);
 			}
 
-			if(right)
+			if (items[I_CUR].val && right && items[I_CUR].max > 0)
 			{
 				// Wrap to OFF - same rationale as the left-click path above.
 				(*items[I_CUR].val) = ((*items[I_CUR].val) + 1 >= items[I_CUR].max) ? 0 : (*items[I_CUR].val) + 1;
