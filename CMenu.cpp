@@ -31,6 +31,7 @@ void cMenu::PreReset(void)
 
 	font->InvalidateDeviceObjects();
 	font->DeleteDeviceObjects();
+	delete font;
 	font = NULL;
 	this->FontCreated = false;
 }
@@ -67,20 +68,18 @@ void cMenu::Init()
 char* cMenu::FPS(int en)
 {
 	static int	 FPScounter = 0;
-	static float FPSfLastTickCount = 0.0f;
-	static float FPSfCurrentTickCount;
-	static char  cfps[6] = "";
-
-	if(!en)
+	static ULONGLONG lastTick = 0;
+	static char cfps[32] = "";
+	if (!en)
 	{
-		FPSfCurrentTickCount = clock() * 0.001f;
+		const ULONGLONG now = GetTickCount64();
 		FPScounter++;
-
-		if((FPSfCurrentTickCount - FPSfLastTickCount) > 1.0f)
+		if (lastTick == 0) lastTick = now;
+		if (now - lastTick >= 1000)
 		{
-			FPSfLastTickCount = FPSfCurrentTickCount;
-			sprintf(cfps,"%d FPS",FPScounter);
+			sprintf_s(cfps, sizeof(cfps), "%d FPS", FPScounter);
 			FPScounter = 0;
+			lastTick = now;
 		}
 	}
 	return cfps;
@@ -132,8 +131,9 @@ char* cMenu::oprintf (const char *fmt, ...)
 	static char buffer[225] = "";
 	va_list va_alist;
 	va_start (va_alist, fmt);
-	_vsnprintf (buffer,sizeof(buffer), fmt, va_alist);
-	va_end (va_alist);
+	_vsnprintf(buffer, sizeof(buffer), fmt, va_alist);
+	va_end(va_alist);
+	buffer[sizeof(buffer) - 1] = '\0';
 	return buffer;
 }
 //-----------------------------------------------------------------------------
@@ -166,14 +166,14 @@ int cMenu::Load(char* szSection, char* szKey, int iDefaultValue,LPCSTR file)
 
 void cMenu::additem(char *title, char *states,int type, int *var, int show, int when)
 {
-	if(show==when)
+	if (show == when && NO >= 0 && NO < ITEM_ARRAY && title && states && var)
 	{
-		strcpy(items[NO].title,title);
-		getfield(states,items[NO].state,*var+1);
-		items[NO].type=type;
-		items[NO].max=nofields(states);
-		items[NO].val=var;
-
+		strncpy(items[NO].title, title, sizeof(items[NO].title) - 1);
+		items[NO].title[sizeof(items[NO].title) - 1] = '\0';
+		getfield(states, items[NO].state, sizeof(items[NO].state), *var + 1);
+		items[NO].type = type;
+		items[NO].max = nofields(states);
+		items[NO].val = var;
 		NO++;
 	}
 	if(type!=T_TEXT)
@@ -227,39 +227,42 @@ void cMenu::atext(char *title, char *states)
 // Desc: Calculates Number of Fields in a String based on deliminator
 //-----------------------------------------------------------------------------
 
-int cMenu::nofields(char *str)
+int cMenu::nofields(const char *str)
 {
-	char *ptr;
-	int  no;
-	for(no=1; (ptr=strchr(str,(char)'|'))!=NULL; no++)str=ptr+1;
-	
-	return no;
+	if (!str || !*str) return 0;
+	int count = 1;
+	for (const char *p = str; *p; ++p)
+		if (*p == '|') ++count;
+	return count;
 }
 
 //-----------------------------------------------------------------------------
 // Name: getfield()
-// Desc: Grabs Field in string based on deliminator
+// Desc: Bounded field extraction for the fixed-size menu state buffer
 //-----------------------------------------------------------------------------
 
-void cMenu::getfield(char *str,char *dst,int no)
+void cMenu::getfield(const char *str, char *dst, size_t dstSize, int no)
 {
-	char *ptr;
-	int  i;
-	for(i=1; (ptr=strchr(str,(char)'|'))!=NULL ; i++) 
+	if (!dst || dstSize == 0) return;
+	dst[0] = '\0';
+	if (!str) return;
+	if (no < 1) no = 1;
+
+	const char *begin = str;
+	for (int field = 1; field < no && *begin; ++field)
 	{
-		if(i==no) break;
-		str=ptr+1;
+		const char *delimiter = strchr(begin, '|');
+		if (!delimiter) { begin += strlen(begin); break; }
+		begin = delimiter + 1;
 	}
-	if(ptr)
-	{
-		i=(int)(ptr-str);
-		strncpy(dst,str,i);
-		dst[i]=0;
-	}
-	else
-		strcpy(dst,str);
+	const char *end = strchr(begin, '|');
+	size_t length = end ? (size_t)(end - begin) : strlen(begin);
+	if (length >= dstSize) length = dstSize - 1;
+	memcpy(dst, begin, length);
+	dst[length] = '\0';
 }
 
+//-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 // Name: DrawBox()
 // Desc: Fills Rectangle using DrawPrimitive Up
@@ -281,7 +284,7 @@ void cMenu::DrawBox( int x, int y, int w, int h, D3DCOLOR Color,LPDIRECT3DDEVICE
 	};
 	pDevice->SetTexture(0, NULL);
 	pDevice->SetPixelShader(NULL);
-	pDevice->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1); 
+	pDevice->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE); 
 	pDevice->SetRenderState(D3DRS_ALPHABLENDENABLE,true);
 	pDevice->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
 	pDevice->SetRenderState(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);
@@ -312,11 +315,13 @@ void cMenu::DrawGameTextPixelFlag(int x, int y, DWORD color, DWORD flags, char *
     if( !szFormat )return;
 
     char logbuf[256] = { 0 };
+    if (!font) return;
 
     va_list va_alist;
-    va_start (va_alist, szFormat);
+    va_start(va_alist, szFormat);
     _vsnprintf(logbuf, sizeof(logbuf), szFormat, va_alist);
-    va_end (va_alist);
+    va_end(va_alist);
+    logbuf[sizeof(logbuf) - 1] = '\0';
 
     if( flags == DT_RIGHT )
     {
