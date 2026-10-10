@@ -2,6 +2,7 @@
 #include "CMenu.h"
 #include "CSound.h"
 #include "Sounds.h"
+#include <new>
 
 //-----------------------------------------------------------------------------
 // Name: PostReset()
@@ -295,6 +296,7 @@ void cMenu::getfield(const char *str, char *dst, size_t dstSize, int no)
 
 void cMenu::DrawBox( int x, int y, int w, int h, D3DCOLOR Color,LPDIRECT3DDEVICE9 pDevice)
 {
+	if (!pDevice || w <= 0 || h <= 0) return;
 	struct Vertex 
 	{
 		float x,y,z,ht;
@@ -379,6 +381,7 @@ void cMenu::DrawGameTextPixelFlag(int x, int y, DWORD color, DWORD flags, char *
 
 void cMenu::ShowMenu(LPDIRECT3DDEVICE9 pDevice)
 {
+	if (!pDevice) return;
 	//-----------------------------------------------------------------------------
 	// Desc: Check Hotkeys
 	// Level-based reads (0x8000 = current physical state) + our own
@@ -640,18 +643,25 @@ void cMenu::ShowMenu(LPDIRECT3DDEVICE9 pDevice)
 				Sound.wav.playsoundmem((LPCSTR)SWITCH);
 			}
 
-			if(up){
-				do{
-					I_CUR=(I_CUR==0)?(NO-1):(I_CUR-1);
-				}while (items[I_CUR].type==T_TEXT);
-				Sound.wav.playsoundmem((LPCSTR)MOVE);
-			}
-
-			if(down || items[I_CUR].type==T_TEXT){
-				do{
-					I_CUR=(I_CUR+1)%NO;
-				}while (items[I_CUR].type==T_TEXT);
-				Sound.wav.playsoundmem((LPCSTR)MOVE);
+			if (up || down || items[I_CUR].type == T_TEXT)
+			{
+				// The list can contain only text rows when conditional items
+				// are hidden. Bound the search so navigation cannot spin forever.
+				bool foundSelectable = false;
+				for (int step = 0; step < NO; ++step)
+				{
+					if (up)
+						I_CUR = (I_CUR == 0) ? (NO - 1) : (I_CUR - 1);
+					else
+						I_CUR = (I_CUR + 1) % NO;
+					if (items[I_CUR].type != T_TEXT && items[I_CUR].val)
+					{
+						foundSelectable = true;
+						break;
+					}
+				}
+				if (foundSelectable)
+					Sound.wav.playsoundmem((LPCSTR)MOVE);
 			}
 		}
 
