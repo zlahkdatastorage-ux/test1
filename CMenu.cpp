@@ -29,8 +29,7 @@ void cMenu::PreReset(void)
 	if (!font) // may be called from Reset_hook() before PostReset ever created it
 		return;
 
-	font->InvalidateDeviceObjects();
-	font->DeleteDeviceObjects();
+	// CD3DFont's destructor releases its device-dependent objects.
 	delete font;
 	font = NULL;
 	this->FontCreated = false;
