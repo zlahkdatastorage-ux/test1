@@ -172,6 +172,24 @@ static char     g_drawSeq[700];
 static unsigned g_drawSeqN = 0;
 static int      g_lastRecIdx = -1;
 static char     g_lastDrawNm[24] = "?";
+// stream-0 vertex buffer bound around each upload -> per-DIP verification
+// (the DIP must draw the VB we saw uploaded; mismatch = idx-map pointing
+// at the wrong draw). Also a live measure of the pool<->upload pairing.
+static IDirect3DVertexBuffer9* g_wmVB[1024] = { 0 };
+static IDirect3DVertexBuffer9* g_lastVB0 = NULL;
+static unsigned g_vbOk = 0, g_vbMis = 0;
+// draw-time entity map: at each fresh DIP the CURRENT draw resolves to
+// pool[idx] (the same map chams uses - visually validated in-game). We
+// mark that entry DRAWN and pin its matrix (the upload that opened the
+// freshness window). drawesp pairs pool[i] with ITS OWN drawn matrix
+// instead of the i-th stream slot - upload order != pool order was
+// proven by idx0 flapping between 56 m and 743 m depth. Entities never
+// drawn (culled/far) get no box - correct ESP behavior.
+static unsigned g_rigSkip = 0;   // consecutive-duplicate collapses (session)
+static float    g_drawPos[4096][16];
+static unsigned char g_drawnLive[4096];
+static float    g_drawPosF[4096][16];
+static unsigned char g_drawnF[4096];
 static unsigned g_telW4 = 0, g_telW12 = 0;          // uploads (per 5s window)
 static unsigned g_telHitW4 = 0, g_telHitW12 = 0;     // origin projected in-view
 static unsigned g_telPushed = 0;                     // markers queued (window)
@@ -593,7 +611,10 @@ HRESULT APIENTRY SetStreamSource_hook(LPDIRECT3DDEVICE9 pDevice, UINT StreamNumb
 {
 	g_sss++;   // audit: does the engine bind vertex streams per draw?
 	if (StreamNumber == 0)
+	{
 		Stride = sStride;
+		g_lastVB0 = pStreamData;   // VB binding snapshot for upload<->draw pairing
+	}
 
 	return SetStreamSource_orig(pDevice, StreamNumber, pStreamData, OffsetInBytes, sStride);
 }
@@ -684,16 +705,42 @@ HRESULT APIENTRY SetVertexShaderConstantF_hook(LPDIRECT3DDEVICE9 pDevice, UINT S
 		// SVSCF "start=4 n=4 M D" is the real per-entity world matrix.
 		if (StartRegister == 4 && Vector4fCount == 4)
 		{
-			// freshness opens on ANY r4 upload, but the POSITION stream
-			// only accepts affine world matrices - non-affine c4 uploads
-			// (UI quads, projection helpers) used to occupy stream slots
-			// and shift every pool[i]<->r4[i] pairing (box teleporting).
-			g_dipsSinceR4 = 0;          // open the chams freshness window
+			// freshness opens on ANY r4 upload; the POSITION stream keeps
+			// affine world matrices only, with CONSECUTIVE-DUPLICATE
+			// COLLAPSE: one entity uploads its matrix once per pass
+			// (body/shadow/depth -> 3-6x per frame), so identical
+			// back-to-back translations = same entity -> refresh in
+			// place, do NOT advance the stream index (else every pass
+			// shifts every pool[i]<->slot mapping).
+			g_dipsSinceR4 = 0;
 			g_r4TickMs = GetTickCount64();
-			if (R4AffineGate(pConstantData) && g_wmSeqN < 1024)
+			if (R4AffineGate(pConstantData))
 			{
-				memcpy(g_wmSeqA[g_wmSeqN], pConstantData, sizeof(g_wmSeqA[0]));
-				g_wmSeqN++;
+				bool collapsed = false;
+				if (g_wmSeqN > 0)
+				{
+					const float* lm = g_wmSeqA[g_wmSeqN - 1];
+					const float* cm = pConstantData;
+					float lx, ly, lz, cx, cy, cz;
+					if (R4SaneT(lm[12], lm[13], lm[14])) { lx = lm[12]; ly = lm[13]; lz = lm[14]; }
+					else                                 { lx = lm[3];  ly = lm[7];  lz = lm[11]; }
+					if (R4SaneT(cm[12], cm[13], cm[14])) { cx = cm[12]; cy = cm[13]; cz = cm[14]; }
+					else                                 { cx = cm[3];  cy = cm[7];  cz = cm[11]; }
+					if (fabsf(cx - lx) < 0.2f && fabsf(cy - ly) < 0.2f &&
+						fabsf(cz - lz) < 0.2f)
+					{
+						g_wmVB[g_wmSeqN - 1] = g_lastVB0;
+						memcpy(g_wmSeqA[g_wmSeqN - 1], pConstantData, sizeof(g_wmSeqA[0]));
+						g_rigSkip++;
+						collapsed = true;
+					}
+				}
+				if (!collapsed && g_wmSeqN < 1024)
+				{
+					g_wmVB[g_wmSeqN] = g_lastVB0;
+					memcpy(g_wmSeqA[g_wmSeqN], pConstantData, sizeof(g_wmSeqA[0]));
+					g_wmSeqN++;
+				}
 			}
 			else
 				g_r4junk++;
@@ -1183,18 +1230,20 @@ HRESULT APIENTRY DrawIndexedPrimitive_hook(LPDIRECT3DDEVICE9 pDevice, D3DPRIMITI
 		if (g_wmSeqN != cachedFrame) { cachedFrame = g_wmSeqN; cachedIdx = -1; }
 
 		// tight freshness window: entity draw clusters come within a handful
-		// of DIPs of their r4 upload. 24/150ms still let world geometry
-		// (doors/cars/trees) through - 6 DIPs / 20ms keeps it player-only.
-		bool fresh = (g_dipsSinceR4 <= 6) &&
-			(GetTickCount64() - g_r4TickMs < 20);
+		// of DIPs of their r4 upload. 6 DIPs/20ms still let world geometry
+		// (doors/cars/trees) through - 3 DIPs/8ms keeps it player-only.
+		bool fresh = (g_dipsSinceR4 <= 3) &&
+			(GetTickCount64() - g_r4TickMs < 8);
 
 		bool hit = false;
 		if (g_wmSeqN >= 1 && c_pb > 0x10000 && c_pe > c_pb && (c_pe - c_pb) < 0x8000)
 		{
 			int pc = (int)((c_pe - c_pb) / 8);
 			int idx = (int)g_wmSeqN - 1;
-			if (idx >= pc) idx = pc - 1;
-			if (idx >= 0)
+			// NEVER clamp: clamping made tail-end environment draws inherit
+			// the LAST pool entry's name (a fence drawn after the uploads
+			// resolved to pool[pc-1] and got chammed as that entity).
+			if (idx >= 0 && idx < pc)
 			{
 				if (idx != cachedIdx)
 				{
@@ -1221,6 +1270,26 @@ HRESULT APIENTRY DrawIndexedPrimitive_hook(LPDIRECT3DDEVICE9 pDevice, D3DPRIMITI
 								sprintf_s(lastName, "%.31s", nm.c_str());
 						}
 					}
+				}
+				// VB verification (diagnostic): does this DIP draw the
+				// stream-0 buffer bound around upload idx? High vbmis = the
+				// upload<->draw pairing is wrong (evidence for the ESP fix).
+				{
+					IDirect3DVertexBuffer9* vb0 = NULL;
+					UINT vbOff = 0, vbSt = 0;
+					if (SUCCEEDED(pDevice->GetStreamSource(0, &vb0, &vbOff, &vbSt)) && vb0)
+					{
+						if (vb0 == g_wmVB[idx]) g_vbOk++; else g_vbMis++;
+						vb0->Release();
+					}
+				}
+				// draw-time entity map: this DIP's entity = pool[idx]
+				// (chams-validated); pin ITS matrix (the upload that
+				// opened the freshness window) - ESP consumes this map.
+				if (idx < 4096)
+				{
+					g_drawnLive[idx] = 1;
+					memcpy(g_drawPos[idx], g_wmSeqA[idx], sizeof(g_drawPos[0]));
 				}
 				hit = cachedHit && fresh;
 
@@ -1249,13 +1318,14 @@ HRESULT APIENTRY DrawIndexedPrimitive_hook(LPDIRECT3DDEVICE9 pDevice, D3DPRIMITI
 			if (GetTickCount64() - cLog > 5000)
 			{
 				cLog = GetTickCount64();
-				if (cApp + cBlk > 0)
+				if (cApp + cBlk > 0 || g_vbOk + g_vbMis > 0)
 				{
-					char cb2[180];
-					sprintf_s(cb2, "chams: applied=%u stale-blocked=%u lastVerts=%u lastChammed=%.31s",
-						cApp, cBlk, cVerts, lastName);
+					char cb2[210];
+					sprintf_s(cb2, "chams: applied=%u stale-blocked=%u vbok=%u vbmis=%u lastVerts=%u lastChammed=%.31s",
+						cApp, cBlk, g_vbOk, g_vbMis, cVerts, lastName);
 					logInit(cb2);
 					cApp = cBlk = 0;
+					g_vbOk = g_vbMis = 0;
 				}
 			}
 		}
@@ -2124,14 +2194,13 @@ void drawesp(IDirect3DDevice9* pDevice)
 	unsigned seqN = g_wmFrameN;
 	int posMem = 0, posSeq = 0, posMiss = 0;
 
-	// ---- VP latch: idx0 = local player = pool[0], paired with the FIRST
-	// r4 upload (validate.txt: idx0 projects to screen center). No VP
-	// proof this frame -> hold the last proven VP. ----
+	// ---- VP latch: idx0 = local player = pool[0], taken from the
+	// draw-time map (his own pinned matrix when drawn this frame). ----
 	D3DXVECTOR3 idx0pos;
 	bool haveIdx0 = false;
 	{
-		if (seqN >= 1)
-			haveIdx0 = SeqAffinePos(seqM[0], idx0pos);
+		if (g_drawnF[0])
+			haveIdx0 = SeqAffinePos(g_drawPosF[0], idx0pos);
 		if (!haveIdx0)
 		{
 			uintptr_t m0 = Memory::ReadMemory<uintptr_t>(pBegin);
@@ -2198,15 +2267,12 @@ void drawesp(IDirect3DDevice9* pDevice)
 		const bool isPlayer = (kind == EK_PLAYER || kind == EK_BOT);
 		const bool isBot = (kind == EK_BOT);
 
-		// ---- 2) POSITION: PRIMARY = this frame's r4 world-matrix upload
-		// paired by pool index (validate.txt MAPPED idx0->center; SVSCF
-		// proved the upload is a real world matrix). The live probe found
-		// NO inline transform on the model (0x310 = config window, 0x3B0/
-		// 0x3A0/0x3C0 = zero), so memory is SECONDARY with the tightened
-		// 2-component gate; no position at all = SKIP. ----
+		// ---- 2) POSITION: PRIMARY = the draw-time map (this DIP's own
+		// pinned matrix, chams-validated identity). Memory secondary;
+		// not drawn this frame AND no memory pos = SKIP. ----
 		D3DXVECTOR3 wpos;
 		bool posOk = false;
-		if (i < (int)seqN && SeqAffinePos(seqM[i], wpos))
+		if (i < 4096 && g_drawnF[i] && SeqAffinePos(g_drawPosF[i], wpos))
 		{
 			posOk = true;
 			posSeq++;
@@ -2883,6 +2949,10 @@ HRESULT APIENTRY Present_hook(LPDIRECT3DDEVICE9 pDevice, CONST RECT* pSourceRect
 	g_wmFrameN = g_wmSeqN <= 1024 ? g_wmSeqN : 1024;
 	memcpy(g_wmFrame, g_wmSeqA, (size_t)g_wmFrameN * sizeof(g_wmSeqA[0]));
 	g_wmSeqN = 0;
+	// snapshot the draw-time entity map for drawesp (same render thread)
+	memcpy(g_drawPosF, g_drawPos, sizeof(g_drawPos));
+	memcpy(g_drawnF, g_drawnLive, sizeof(g_drawnLive));
+	memset(g_drawnLive, 0, sizeof(g_drawnLive));
 	g_vpFrameN = g_vpSeqN <= 1024 ? g_vpSeqN : 1024;
 	memcpy(g_vpFrame, g_vpSeqA, (size_t)g_vpFrameN * sizeof(g_vpSeqA[0]));
 	g_vpSeqN = 0;
@@ -3159,13 +3229,28 @@ HRESULT APIENTRY Present_hook(LPDIRECT3DDEVICE9 pDevice, CONST RECT* pSourceRect
 			char rb[430];
 			int o = sprintf_s(rb, "r4pos: n=%u junk=%u |", g_wmFrameN, g_r4junk);
 			int shown = 0;
-			for (unsigned i = 0; i < g_wmFrameN && shown < 6; i++)
+			for (unsigned i = 0; i < g_wmFrameN && shown < 8; i++)
 			{
 				const float* m = g_wmFrame[i];
 				if (!R4AffineGate(m)) continue;
 				float tx, ty, tz;
 				if (R4SaneT(m[12], m[13], m[14])) { tx = m[12]; ty = m[13]; tz = m[14]; }
 				else                              { tx = m[3];  ty = m[7];  tz = m[11]; }
+				// dedupe: the same rig matrix uploads dozens of times per
+				// frame and drowned the beacon (all-identical refs made the
+				// brute-force probe match only d3d9 staging copies).
+				bool dup = false;
+				for (unsigned j = 0; j < i && !dup; j++)
+				{
+					const float* mj = g_wmFrame[j];
+					if (!R4AffineGate(mj)) continue;
+					float jx, jy, jz;
+					if (R4SaneT(mj[12], mj[13], mj[14])) { jx = mj[12]; jy = mj[13]; jz = mj[14]; }
+					else                                 { jx = mj[3];  jy = mj[7];  jz = mj[11]; }
+					if (fabsf(jx - tx) < 2.0f && fabsf(jy - ty) < 2.0f &&
+						fabsf(jz - tz) < 2.0f) dup = true;
+				}
+				if (dup) continue;
 				o += sprintf_s(rb + o, sizeof(rb) - o, " (%.1f,%.1f,%.1f)", tx, ty, tz);
 				shown++;
 			}
@@ -3186,6 +3271,32 @@ HRESULT APIENTRY Present_hook(LPDIRECT3DDEVICE9 pDevice, CONST RECT* pSourceRect
 				cam++;
 			}
 			logInit(rb);
+		}
+	}
+	{
+		// VB pointer beacon: distinct stream-0 VBs bound at this frame's
+		// uploads (probe5 matches these VALUES inside pool model objects
+		// -> VB->entity map = draw-time identity without order guesses).
+		static ULONGLONG lastVb = 0;
+		if (GetTickCount64() - lastVb > 5000)
+		{
+			lastVb = GetTickCount64();
+			char vbb[400];
+			int o = sprintf_s(vbb, "vbptrs: n=%u:", g_wmFrameN);
+			int shown = 0;
+			for (unsigned i = 0; i < g_wmFrameN && shown < 8; i++)
+			{
+				bool dup = false;
+				for (unsigned j = 0; j < i; j++)
+					if (g_wmVB[j] == g_wmVB[i]) { dup = true; break; }
+				if (dup || !g_wmVB[i]) continue;
+				o += sprintf_s(vbb + o, sizeof(vbb) - o, " 0x%llX",
+					(unsigned long long)(uintptr_t)g_wmVB[i]);
+				shown++;
+			}
+			o += sprintf_s(vbb + o, sizeof(vbb) - o, " last0=0x%llX",
+				(unsigned long long)(uintptr_t)g_lastVB0);
+			logInit(vbb);
 		}
 	}
 	{
@@ -3214,8 +3325,8 @@ HRESULT APIENTRY Present_hook(LPDIRECT3DDEVICE9 pDevice, CONST RECT* pSourceRect
 				sprintf_s(pick, "%s%s d4=%d d0=%d", g_entStream ? "c0" : "c4",
 					g_entColMode ? "+col4" : "+row4", g_lastDist4, g_lastDist0);
 			char tbuf[700];
-			int o = sprintf_s(tbuf, "TEL st=%u vs=%u sss=%u dip=%u att=%u pick=%s r4j=%u pool=%d | moves:",
-				g_telST, g_vsSeen, g_sss, g_telDip, g_wvpAttTotal, pick, g_r4junk, g_poolN);
+			int o = sprintf_s(tbuf, "TEL st=%u vs=%u sss=%u dip=%u att=%u pick=%s r4j=%u rs=%u pool=%d | moves:",
+				g_telST, g_vsSeen, g_sss, g_telDip, g_wvpAttTotal, pick, g_r4junk, g_rigSkip, g_poolN);
 			for (int g = 0; g <= 28; g += 4)
 				o += sprintf_s(tbuf + o, sizeof(tbuf) - o, " c%d=%u", g, g_wvpMov[g]);
 			// any OTHER start (incl. unaligned c13!) that moved - capped

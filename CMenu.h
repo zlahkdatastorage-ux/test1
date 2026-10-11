@@ -130,8 +130,8 @@ private:
 	void	atext(char *title, char *states,int show, int when);
 	void	atext(char *title, char *states);
 	void	additem(char *title, char *states,int type, int *var, int show, int when);
-	void	getfield(const char *str, char *dst, size_t dstSize, int no);
-	int		nofields(const char *str);
+	void	getfield(char *str,char *dst,int no);
+	int		nofields(char *str);
 	void	Init(void);
 	int		Load(char* szSection, char* szKey, int iDefaultValue,LPCSTR file);
 	void	Save(char* szSection, char* szKey, int iValue,LPCSTR file);
